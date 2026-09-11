@@ -1,5 +1,7 @@
 import type { DifferenceMattingOptions, Rgb } from "unbg/core";
-export type Settings = {
+import { DEFAULT_EXPORT, validateExport } from "@/export-plan";
+import type { ExportSettings } from "@/export-plan";
+export type Settings = ExportSettings & {
   mode: "convert" | "ai" | "pair";
   format: "png" | "webp" | "jpg";
   jpegQuality: number;
@@ -13,6 +15,7 @@ export type Settings = {
   suffix: string;
 };
 export const DEFAULT_SETTINGS: Settings = {
+  ...DEFAULT_EXPORT,
   mode: "convert",
   format: "png",
   jpegQuality: 95,
@@ -26,7 +29,16 @@ export const DEFAULT_SETTINGS: Settings = {
   suffix: "-converted",
 };
 export type Asset = { file: File; url: string };
+export type OutputVariant = {
+  blob: Blob;
+  width: number;
+  height: number;
+  scale: number;
+  capped: boolean;
+  originalKept?: boolean;
+};
 export type Output = {
+  variants?: OutputVariant[];
   blob: Blob;
   width: number;
   height: number;
@@ -44,7 +56,10 @@ export type Pair = {
   second?: Asset;
   status: "idle" | "processing" | "done" | "error";
   selected: boolean;
-  output?: Output & { url: string };
+  output?: Omit<Output, "variants"> & {
+    url: string;
+    variants?: (OutputVariant & { url: string })[];
+  };
   error?: string;
 };
 export type WorkerRequest = { first: File; second?: File; settings: Settings };
@@ -72,6 +87,11 @@ export function parseColor(value: string): Rgb | undefined {
   throw new Error("배경색은 #ffffff 또는 255,255,255 형식으로 입력해 주세요.");
 }
 export function getOptions(settings: Settings): DifferenceMattingOptions {
+  validateExport(settings);
+  if (settings.format === "png" && settings.compression === "lossy")
+    throw new Error("PNG는 무손실 압축을 사용해 주세요.");
+  if (settings.format === "jpg" && settings.compression === "lossless")
+    throw new Error("JPG는 품질 조절 압축을 사용해 주세요.");
   if (
     !Number.isFinite(settings.jpegQuality) ||
     settings.jpegQuality < 1 ||
@@ -192,4 +212,22 @@ export function outputNames(
     names.set(pair.id, name);
   }
   return names;
+}
+
+export function exportFiles(pairs: Pair[], suffix: string, format: Settings["format"]) {
+  const names = outputNames(pairs, suffix, format);
+  const used = new Set<string>();
+  return pairs.flatMap((pair) => {
+    if (!pair.output) return [];
+    const variants = pair.output.variants ?? [pair.output];
+    return variants.map((variant) => {
+      const base = (names.get(pair.id) ?? `image.${format}`).replace(/\.[^.]+$/, "");
+      const variantSuffix = variants.length > 1 ? `-${variant.width}x${variant.height}` : "";
+      let name = `${base}${variantSuffix}.${format}`;
+      let counter = 2;
+      while (used.has(name.toLowerCase())) name = `${base}${variantSuffix}-${counter++}.${format}`;
+      used.add(name.toLowerCase());
+      return { name, blob: variant.blob, pairId: pair.id, url: variant.url };
+    });
+  });
 }

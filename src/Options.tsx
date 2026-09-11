@@ -1,4 +1,6 @@
 import { RotateCcw, SlidersHorizontal, ChevronDown } from "lucide-react";
+import { Presets } from "@/Presets";
+import { ExportOptions } from "@/ExportOptions";
 import { DEFAULT_SETTINGS, parseColor, colorHex } from "@/model";
 import type { Settings } from "@/model";
 function RangeField({
@@ -94,11 +96,15 @@ export function Options({
   onChange,
   disabled,
   error,
+  onMessage,
+  sourceSize,
 }: {
   settings: Settings;
   onChange: (settings: Settings) => void;
   disabled: boolean;
   error: string;
+  onMessage: (message: string) => void;
+  sourceSize?: { width: number; height: number };
 }) {
   const removesBackground = settings.mode !== "convert";
   function update<K extends keyof Settings>(key: K, value: Settings[K]) {
@@ -122,45 +128,81 @@ export function Options({
         </button>
       </div>
       <fieldset disabled={disabled} className="options-fields">
+        <Presets settings={settings} onChange={onChange} onMessage={onMessage} />
         <div className="option-section">
           <h3>저장 형식</h3>
           <div className="select-wrap">
             <select
               aria-label="저장 형식"
               value={settings.format}
-              onChange={(event) => update("format", event.target.value as Settings["format"])}
+              onChange={(event) => {
+                const format = event.target.value as Settings["format"];
+                onChange({
+                  ...settings,
+                  format,
+                  compression:
+                    format === "png" && settings.compression === "lossy"
+                      ? "lossless"
+                      : format === "jpg" && settings.compression === "lossless"
+                        ? "lossy"
+                        : settings.compression,
+                });
+              }}
             >
               <option value="png">PNG · 무손실</option>
-              <option value="webp">WebP · 무손실</option>
+              <option value="webp">WebP · 투명도 지원</option>
               <option value="jpg" disabled={removesBackground}>
                 JPG · 손실 압축{removesBackground ? " (배경 보존 전용)" : ""}
               </option>
             </select>
             <ChevronDown size={15} />
           </div>
-          {settings.format === "jpg" ? (
-            <>
-              <RangeField
-                label="JPG 품질"
-                hint="높을수록 선명하지만 파일 크기가 커져요."
-                value={settings.jpegQuality}
-                min={1}
-                max={100}
-                step={1}
-                onChange={(value) => update("jpegQuality", value)}
-              />
-              <p className="section-help">
-                JPG는 무손실이 아니에요. 투명 영역은 흰색으로 저장해요. JPG 원본은 재압축하지
-                않아요.
-              </p>
-            </>
-          ) : (
-            <p className="section-help">
-              8-bit 픽셀 기준 무손실. 크기와 투명도를 유지해요. 색상 프로필·메타데이터는 형식 변환
-              시 보존하지 않아요.
-            </p>
+          <label className="compression-label" htmlFor="compression">
+            용량 최적화
+          </label>
+          <div className="select-wrap">
+            <select
+              id="compression"
+              aria-label="용량 최적화"
+              value={settings.compression}
+              onChange={(event) =>
+                update("compression", event.target.value as Settings["compression"])
+              }
+            >
+              <option value="off">끄기 · 같은 형식은 원본 유지</option>
+              <option value="lossless" disabled={settings.format === "jpg"}>
+                무손실 압축{settings.format === "jpg" ? " (PNG·WebP 전용)" : ""}
+              </option>
+              <option value="lossy" disabled={settings.format === "png"}>
+                품질 조절 압축{settings.format === "png" ? " (WebP·JPG 전용)" : ""}
+              </option>
+            </select>
+          </div>
+          {(settings.compression === "lossy" || settings.format === "jpg") && (
+            <RangeField
+              label={settings.format === "jpg" ? "JPG 품질" : "WebP 품질"}
+              hint="품질을 낮출수록 용량이 줄어요. 비교 화면에서 디테일을 확인하세요."
+              value={settings.format === "jpg" ? settings.jpegQuality : settings.webpQuality}
+              min={1}
+              max={100}
+              step={1}
+              onChange={(value) =>
+                update(settings.format === "jpg" ? "jpegQuality" : "webpQuality", value)
+              }
+            />
+          )}
+          <p className="section-help">
+            {settings.format === "jpg"
+              ? "JPG는 품질 100도 손실 압축이에요. 투명 영역은 흰색으로 저장해요. 압축을 끄면 같은 형식·크기의 원본을 유지해요."
+              : settings.compression === "lossy"
+                ? "용량을 줄이는 대신 픽셀이 달라질 수 있어요. 투명도는 지원해요."
+                : "무손실은 8-bit 픽셀 기준이에요. 형식 변환·재압축 시 색상 프로필과 메타데이터는 보존하지 않아요."}
+          </p>
+          {settings.compression !== "off" && (
+            <p className="input-hint">같은 형식·크기에서 결과가 더 크면 원본을 유지해요.</p>
           )}
         </div>
+        <ExportOptions settings={settings} onChange={onChange} sourceSize={sourceSize} />
         {settings.mode === "ai" && (
           <div className="option-section model-note">
             <h3>무료 자동 배경 제거</h3>
@@ -219,7 +261,7 @@ export function Options({
           </div>
         )}
         {removesBackground && (
-          <details className="option-section advanced" open>
+          <details className="option-section advanced">
             <summary>
               세부 조정
               <ChevronDown size={15} />

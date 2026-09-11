@@ -1,5 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import {
+  ClipboardPaste,
+  Keyboard,
+  Columns2,
   ArrowDownToLine,
   ArrowRight,
   Check,
@@ -23,6 +26,8 @@ import {
   X,
 } from "lucide-react";
 import { zip } from "fflate";
+import { ImagePreview } from "@/ImagePreview";
+import { Shortcuts, isEditing } from "@/Shortcuts";
 import { Options } from "@/Options";
 import { createDemoFiles, DEMO_SVG } from "@/demo";
 import {
@@ -33,15 +38,21 @@ import {
   fileSize,
   getOptions,
   outputNames,
+  exportFiles,
   pairFiles,
 } from "@/model";
 import type { Asset, Pair, Settings, WorkerResponse, Output, ProcessingProgress } from "@/model";
 const DEMO_URL = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(DEMO_SVG)}`;
 const STATUS_MAP = { idle: "변환 대기", processing: "변환 중", done: "완료", error: "확인 필요" };
+function disposeOutput(output: Pair["output"]) {
+  if (!output) return;
+  URL.revokeObjectURL(output.url);
+  output.variants?.forEach((variant) => URL.revokeObjectURL(variant.url));
+}
 function dispose(pair: Pair) {
   if (pair.first) URL.revokeObjectURL(pair.first.url);
   if (pair.second) URL.revokeObjectURL(pair.second.url);
-  if (pair.output) URL.revokeObjectURL(pair.output.url);
+  disposeOutput(pair.output);
 }
 export function App() {
   const [pairs, setPairs] = useState<Pair[]>([]);
@@ -55,9 +66,18 @@ export function App() {
   const [zipping, setZipping] = useState(false);
   const [message, setMessage] = useState("");
   const [dragging, setDragging] = useState(false);
-  const [previewMode, setPreviewMode] = useState<"result" | "first" | "second">("result");
+  const [previewMode, setPreviewMode] = useState<"result" | "first" | "second" | "compare">(
+    "result",
+  );
   const [backdrop, setBackdrop] = useState("checker");
-  const [zoom, setZoom] = useState(100);
+  const [zoom, setZoom] = useState(0);
+  const [shortcuts, setShortcuts] = useState(false);
+  const [pasting, setPasting] = useState(false);
+  const pasteVersion = useRef(0);
+  const pastePending = useRef(false);
+  const [variantIndex, setVariantIndex] = useState(0);
+  const [sourceSize, setSourceSize] = useState<{ width: number; height: number } | undefined>();
+  const modifier = /Mac|iPhone|iPad/.test(navigator.platform) ? "⌘" : "Ctrl";
   const [filter, setFilter] = useState("all");
   const [guide, setGuide] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -75,6 +95,7 @@ export function App() {
   }
   useEffect(
     () => () => {
+      pasteVersion.current++;
       runningRef.current = false;
       abortRef.current?.();
       workerRef.current?.terminate();
@@ -87,9 +108,16 @@ export function App() {
     else guideRef.current?.close();
   }, [guide]);
   const active = pairs.find((p) => p.id === activeId) ?? pairs[0];
+  const activeOutput = active?.output?.variants?.[variantIndex] ?? active?.output;
+  const allExportFiles = exportFiles(pairs, settings.suffix, settings.format);
+  const activeExport = allExportFiles.find(
+    (entry) => entry.pairId === active?.id && entry.url === activeOutput?.url,
+  );
   const completed = pairs.filter((p) => p.output);
   const selected = pairs.filter((p) => p.selected);
   const selectedDone = selected.filter((p) => p.output);
+  const selectedIds = new Set(selectedDone.map((pair) => pair.id));
+  const selectedOutputCount = allExportFiles.filter((file) => selectedIds.has(file.pairId)).length;
   const isSingle = settings.mode !== "pair";
   const removesBackground = settings.mode !== "convert";
   const formatLabel = settings.format === "webp" ? "WebP" : settings.format.toUpperCase();
@@ -103,11 +131,131 @@ export function App() {
   } catch (error) {
     optionError = error instanceof Error ? error.message : "옵션을 확인해 주세요.";
   }
+  useEffect(() => {
+    setVariantIndex(0);
+    setSourceSize(undefined);
+    if (!active?.first?.url) return;
+    let cancelled = false;
+    const image = new Image();
+    image.onload = () => {
+      if (!cancelled) setSourceSize({ width: image.naturalWidth, height: image.naturalHeight });
+    };
+    image.src = active.first.url;
+    return () => {
+      cancelled = true;
+    };
+  }, [active?.id, active?.first?.url]);
+  useEffect(() => {
+    function paste(event: ClipboardEvent) {
+      if (isEditing(event.target) || guide || shortcuts) return;
+      const files = Array.from(event.clipboardData?.files ?? []);
+      if (!files.length) return;
+      event.preventDefault();
+      if (busy || zipping) {
+        setMessage("진행 중인 작업이 끝나면 이미지를 붙여넣어 주세요.");
+        return;
+      }
+      addFiles(files);
+    }
+    function keyboard(event: KeyboardEvent) {
+      if (
+        event.defaultPrevented ||
+        event.repeat ||
+        event.isComposing ||
+        isEditing(event.target) ||
+        guide ||
+        shortcuts
+      )
+        return;
+      const command = event.metaKey || event.ctrlKey;
+      const key = event.key.toLowerCase();
+      if (command && !event.altKey) {
+        if (key === "o" && !busy && !zipping) {
+          event.preventDefault();
+          inputRef.current?.click();
+        } else if (key === "enter" && !busy && !zipping) {
+          event.preventDefault();
+          void convert();
+        } else if (key === "s" && event.shiftKey && !busy && !zipping && selectedDone.length) {
+          event.preventDefault();
+          void downloadZip(selectedDone);
+        }
+        return;
+      }
+      if (event.altKey) return;
+      if (key === "?") {
+        event.preventDefault();
+        setShortcuts(true);
+      } else if (key === "escape" && busy) {
+        event.preventDefault();
+        stop();
+      } else if (key === "b" && active?.output) {
+        event.preventDefault();
+        setPreviewMode((mode) => (mode === "compare" ? "result" : "compare"));
+      } else if (key === "0") setZoom(0);
+      else if (key === "1") setZoom(100);
+      else if ((key === "arrowleft" || key === "arrowright") && visible.length) {
+        if (event.target instanceof HTMLElement && event.target.closest("button, summary, a"))
+          return;
+        event.preventDefault();
+        const index = visible.findIndex((pair) => pair.id === active?.id);
+        setActiveId(
+          visible[
+            Math.max(0, Math.min(visible.length - 1, index + (key === "arrowright" ? 1 : -1)))
+          ].id,
+        );
+      }
+    }
+    window.addEventListener("paste", paste);
+    window.addEventListener("keydown", keyboard);
+    return () => {
+      window.removeEventListener("paste", paste);
+      window.removeEventListener("keydown", keyboard);
+    };
+  });
+  async function pasteClipboard() {
+    if (runningRef.current || zipping || pastePending.current) return;
+    if (!navigator.clipboard?.read) {
+      setMessage(`이미지를 복사한 뒤 ${modifier}+V로 붙여넣어 주세요.`);
+      return;
+    }
+    pastePending.current = true;
+    setPasting(true);
+    const version = pasteVersion.current;
+    try {
+      const items = await navigator.clipboard.read();
+      const files: File[] = [];
+      for (const item of items) {
+        const type = item.types.find((value) =>
+          ["image/png", "image/jpeg", "image/webp"].includes(value),
+        );
+        if (!type) continue;
+        const blob = await item.getType(type);
+        files.push(
+          new File(
+            [blob],
+            `clipboard-${Date.now()}-${files.length + 1}.${type === "image/jpeg" ? "jpg" : type.split("/")[1]}`,
+            { type },
+          ),
+        );
+      }
+      if (version !== pasteVersion.current || runningRef.current) return;
+      if (files.length) addFiles(files);
+      else setMessage("클립보드에 이미지가 없어요. 이미지 자체를 복사한 뒤 다시 붙여넣어 주세요.");
+    } catch {
+      setMessage(
+        `클립보드를 읽지 못했어요. 이미지를 복사한 뒤 이 화면에서 ${modifier}+V로 붙여넣어 주세요.`,
+      );
+    } finally {
+      pastePending.current = false;
+      setPasting(false);
+    }
+  }
   function asset(file: File): Asset {
     return { file, url: URL.createObjectURL(file) };
   }
   function addFiles(files: File[]) {
-    if (runningRef.current) return;
+    if (runningRef.current || zipping) return;
     const accepted: File[] = [];
     const errors: string[] = [];
     let size = pairsRef.current.reduce(
@@ -178,10 +326,11 @@ export function App() {
     }
   }
   function changeSettings(next: Settings) {
-    if (runningRef.current) return;
+    if (runningRef.current || zipping || JSON.stringify(next) === JSON.stringify(settings)) return;
     const { suffix: previousSuffix, ...previousProcessing } = settings;
     const { suffix: nextSuffix, ...nextProcessing } = next;
     if (next.mode !== settings.mode) {
+      pasteVersion.current++;
       if (
         demoPendingRef.current ||
         (pairsRef.current.length && (next.mode === "pair" || settings.mode === "pair"))
@@ -192,6 +341,7 @@ export function App() {
       workerRef.current = null;
     }
     setSettings(next);
+    setVariantIndex(0);
     if (
       previousSuffix !== nextSuffix &&
       JSON.stringify(previousProcessing) === JSON.stringify(nextProcessing)
@@ -200,7 +350,7 @@ export function App() {
     setMessage(pairsRef.current.length ? "옵션이 바뀌었어요. 다시 변환해 주세요." : "");
     updatePairs((old) =>
       old.map((p) => {
-        if (p.output) URL.revokeObjectURL(p.output.url);
+        disposeOutput(p.output);
         return { ...p, output: undefined, status: "idle", error: undefined };
       }),
     );
@@ -237,7 +387,7 @@ export function App() {
     }
     const prev = pair[target.slot];
     if (prev) URL.revokeObjectURL(prev.url);
-    if (pair.output) URL.revokeObjectURL(pair.output.url);
+    disposeOutput(pair.output);
     patch(pair.id, {
       [target.slot]: asset(file),
       output: undefined,
@@ -291,7 +441,7 @@ export function App() {
           setProgress(event.data.progress);
           return;
         }
-        finish();
+        finish(!event.data.ok);
         if (event.data.ok) resolve(event.data.output);
         else reject(new Error(event.data.error));
       };
@@ -320,7 +470,14 @@ export function App() {
           if (!runningRef.current) break;
           patch(pair.id, {
             status: "done",
-            output: { ...output, url: URL.createObjectURL(output.blob) },
+            output: {
+              ...output,
+              url: URL.createObjectURL(output.blob),
+              variants: output.variants?.map((variant) => ({
+                ...variant,
+                url: URL.createObjectURL(variant.blob),
+              })),
+            },
           });
           successes++;
         } catch (error) {
@@ -353,19 +510,16 @@ export function App() {
     setZipping(true);
     try {
       const entries: Record<string, Uint8Array> = {};
-      for (const p of targets) {
-        if (p.output)
-          entries[names.get(p.id) ?? `${cleanName(p.name)}.${settings.format}`] = new Uint8Array(
-            await p.output.blob.arrayBuffer(),
-          );
-      }
+      const targetIds = new Set(targets.map((pair) => pair.id));
+      const files = allExportFiles.filter((file) => targetIds.has(file.pairId));
+      for (const file of files) entries[file.name] = new Uint8Array(await file.blob.arrayBuffer());
       const bytes = await new Promise<Uint8Array<ArrayBuffer>>((resolve, reject) =>
         zip(entries, { level: 0 }, (error, data) =>
           error ? reject(error) : resolve(new Uint8Array(data)),
         ),
       );
       download(new Blob([bytes], { type: "application/zip" }), `unbg-studio-${targets.length}.zip`);
-      setMessage(`${targets.length}개 ${formatLabel} 파일을 ZIP으로 저장했어요.`);
+      setMessage(`${files.length}개 ${formatLabel} 파일을 ZIP으로 저장했어요.`);
     } catch {
       setMessage("ZIP을 만들지 못했어요. 선택 개수를 줄이거나 개별 다운로드해 주세요.");
     } finally {
@@ -373,6 +527,7 @@ export function App() {
     }
   }
   function clearAll() {
+    pasteVersion.current++;
     workerRef.current?.terminate();
     workerRef.current = null;
     setProgress(null);
@@ -387,7 +542,7 @@ export function App() {
       ? active.first?.url
       : previewMode === "second"
         ? active.second?.url
-        : active.output?.url
+        : (activeOutput?.url ?? (active.status === "idle" ? active.first?.url : undefined))
     : DEMO_URL;
   return (
     <div className="app-shell">
@@ -405,6 +560,16 @@ export function App() {
           <span className="local-badge">
             <span />내 기기에서 안전하게
           </span>
+          <button
+            className="text-button shortcut-trigger"
+            aria-label="단축키 안내"
+            title="단축키 안내 (?)"
+            data-tip="단축키 보기  ?"
+            onClick={() => setShortcuts(true)}
+          >
+            <Keyboard size={16} />
+            단축키<kbd>?</kbd>
+          </button>
           <button className="text-button" onClick={() => setGuide(true)}>
             <CircleHelp size={16} />
             사용 가이드
@@ -419,7 +584,7 @@ export function App() {
               <br className="mobile-break" /> 이미지 그대로.
             </h1>
             <p>
-              형식은 바꾸고, 필요할 때 배경도 제거해요.
+              형식, 용량, 크기까지 한 번에 정리해요.
               <br className="mobile-break" /> 여러 장도 한 번에. 무료로, 내 브라우저에서.
             </p>
           </div>
@@ -444,6 +609,12 @@ export function App() {
                 changeSettings({
                   ...settings,
                   mode: event.target.checked ? "ai" : "convert",
+                  compression:
+                    event.target.checked &&
+                    settings.format === "jpg" &&
+                    settings.compression === "lossy"
+                      ? "lossless"
+                      : settings.compression,
                   format:
                     event.target.checked && settings.format === "jpg" ? "png" : settings.format,
                 })
@@ -472,7 +643,7 @@ export function App() {
           )}
           <span>
             {!removesBackground
-              ? "기본은 형식만 변환해요. 모델 다운로드 없이 바로 시작하세요."
+              ? "배경은 그대로. 필요한 압축과 크기만 선택하세요."
               : !isSingle && pairs.length
                 ? "배경 제거 방식을 바꾸려면 작업 공간을 비워 주세요."
                 : "내 기기에서 처리 · 토큰·API 키 불필요"}
@@ -489,14 +660,32 @@ export function App() {
                   {unit}
                 </span>
               </div>
-              <button
-                className="small-button"
-                disabled={busy}
-                onClick={() => inputRef.current?.click()}
-              >
-                <Plus size={15} />
-                이미지 추가
-              </button>
+              <div className="intake-actions">
+                <button
+                  className="small-button"
+                  disabled={busy || zipping || pasting}
+                  aria-label="이미지 붙여넣기"
+                  title={`이미지 붙여넣기 (${modifier}+V)`}
+                  data-tip={`이미지 붙여넣기  ${modifier} V`}
+                  onClick={() => void pasteClipboard()}
+                >
+                  {pasting ? (
+                    <LoaderCircle className="spin" size={15} />
+                  ) : (
+                    <ClipboardPaste size={15} />
+                  )}
+                  붙여넣기
+                </button>
+                <button
+                  className="small-button"
+                  disabled={busy || zipping}
+                  title={`이미지 추가 (${modifier}+O)`}
+                  onClick={() => inputRef.current?.click()}
+                >
+                  <Plus size={15} />
+                  이미지 추가
+                </button>
+              </div>
             </div>
             <div className="canvas-toolbar">
               <div className="segmented" aria-label="미리보기 이미지">
@@ -513,6 +702,15 @@ export function App() {
                     {["변환 결과", isSingle ? "원본" : "원본 A", "원본 B"][i]}
                   </button>
                 ))}
+                <button
+                  aria-pressed={previewMode === "compare"}
+                  disabled={!active?.output}
+                  title="원본·결과 비교 (B)"
+                  onClick={() => setPreviewMode("compare")}
+                >
+                  <Columns2 size={13} />
+                  비교
+                </button>
               </div>
               <div className="preview-tools">
                 <div className="swatches" aria-label="미리보기 배경">
@@ -532,12 +730,27 @@ export function App() {
                   onChange={(e) => setZoom(Number(e.target.value))}
                 >
                   <option value={50}>50%</option>
-                  <option value={100}>맞춤</option>
+                  <option value={0}>맞춤</option>
+                  <option value={100}>100% · 실제 크기</option>
                   <option value={150}>150%</option>
                   <option value={200}>200%</option>
                 </select>
               </div>
             </div>
+            {active?.output?.variants && active.output.variants.length > 1 && (
+              <div className="variant-strip" aria-label="결과 크기 선택">
+                {active.output.variants.map((variant, index) => (
+                  <button
+                    key={variant.url}
+                    aria-pressed={index === variantIndex}
+                    onClick={() => setVariantIndex(index)}
+                  >
+                    {variant.width} × {variant.height}
+                    <span>{fileSize(variant.blob.size)}</span>
+                  </button>
+                ))}
+              </div>
+            )}
             <div
               className={`preview-canvas ${backdrop} ${dragging ? "dragging" : ""}`}
               onDragEnter={(e) => {
@@ -558,13 +771,39 @@ export function App() {
                 addFiles(Array.from(e.dataTransfer.files));
               }}
             >
+              {active?.status === "idle" && !active.output && (
+                <span className="canvas-caption">원본 · 변환 전</span>
+              )}
               {!active && (
                 <span className="canvas-caption">
                   <span className="caption-dot" />
                   작은 디테일까지, 그대로
                 </span>
               )}
-              {previewUrl ? (
+              {activeOutput &&
+              active?.first &&
+              (previewMode === "result" || previewMode === "compare") ? (
+                <ImagePreview
+                  original={active.first.url}
+                  result={activeOutput.url}
+                  width={activeOutput.width}
+                  height={activeOutput.height}
+                  compare={previewMode === "compare"}
+                  zoom={zoom}
+                  alt={active.name}
+                />
+              ) : active && previewUrl && sourceSize ? (
+                <ImagePreview
+                  original={previewUrl}
+                  result={previewUrl}
+                  width={sourceSize.width}
+                  height={sourceSize.height}
+                  compare={false}
+                  zoom={zoom}
+                  alt={active.name}
+                  resultLabel={previewMode === "second" ? "원본 B" : "원본"}
+                />
+              ) : previewUrl ? (
                 <div className="preview-scroll">
                   <img
                     className={`main-preview ${!active ? "demo-art" : ""}`}
@@ -575,9 +814,14 @@ export function App() {
                         : "반투명한 파란 꽃 예제"
                     }
                     style={{
-                      width: `${zoom * 0.66}%`,
-                      maxWidth: zoom === 100 ? 520 : "none",
-                      maxHeight: zoom > 100 ? "none" : "100%",
+                      width:
+                        zoom === 0
+                          ? "66%"
+                          : sourceSize
+                            ? (sourceSize.width * zoom) / 100
+                            : `${zoom * 0.66}%`,
+                      maxWidth: zoom === 0 ? 520 : "none",
+                      maxHeight: zoom === 0 ? "100%" : "none",
                     }}
                   />
                 </div>
@@ -606,7 +850,7 @@ export function App() {
                         : isSingle
                           ? removesBackground
                             ? "변환하기를 누르면 이 이미지의 배경을 자동으로 제거해요."
-                            : `${formatLabel}로 변환할 준비가 되었어요. 배경과 크기는 그대로예요.`
+                            : `${formatLabel}로 저장할 준비가 되었어요. 오른쪽에서 크기와 압축을 조절하세요.`
                           : "아래에서 원본 두 장을 확인하고 변환을 시작하세요.")}
                   </p>
                   {active?.status === "processing" && progress?.percent !== undefined && (
@@ -637,20 +881,20 @@ export function App() {
                   </span>
                 </>
               )}
-              {active?.output && (
+              {activeOutput && (
                 <div className="output-caption">
                   <span>
                     <CheckCircle2 size={14} />
-                    {active.output.width} × {active.output.height}
-                    <span className="muted">{fileSize(active.output.blob.size)}</span>
+                    {activeOutput.width} × {activeOutput.height}
+                    <span className="muted">{fileSize(activeOutput.blob.size)}</span>
                   </span>
                   <button
                     className="small-button"
                     onClick={() =>
-                      active.output &&
+                      activeOutput &&
                       download(
-                        active.output.blob,
-                        names.get(active.id) ?? `image.${settings.format}`,
+                        activeOutput.blob,
+                        activeExport?.name ?? names.get(active.id) ?? `image.${settings.format}`,
                       )
                     }
                   >
@@ -667,6 +911,36 @@ export function App() {
                 </div>
               )}
             </div>
+            {activeOutput && active?.first && (
+              <div className="savings-strip">
+                <span>
+                  원본 <strong>{fileSize(active.first.file.size)}</strong>
+                </span>
+                <ArrowRight size={14} />
+                <span>
+                  결과 <strong>{fileSize(activeOutput.blob.size)}</strong>
+                </span>
+                <strong
+                  className={
+                    activeOutput.blob.size < active.first.file.size
+                      ? "saving-positive"
+                      : "saving-neutral"
+                  }
+                >
+                  {activeOutput.blob.size === active.first.file.size
+                    ? "용량 동일"
+                    : `${Math.abs((1 - activeOutput.blob.size / active.first.file.size) * 100).toFixed(1)}% ${activeOutput.blob.size < active.first.file.size ? "감소" : "증가"}`}
+                </strong>
+                {previewMode === "compare" && (
+                  <small>
+                    결과 크기에 맞춰 비교
+                    {settings.cropMode !== "off" && removesBackground
+                      ? " · 잘린 영역은 구도가 달라요"
+                      : ""}
+                  </small>
+                )}
+              </div>
+            )}
             {active ? (
               <div className="active-details">
                 <label className="output-name">
@@ -686,7 +960,7 @@ export function App() {
                       <button
                         key={slot}
                         className="source-slot"
-                        disabled={busy}
+                        disabled={busy || zipping}
                         onClick={() => requestReplace(active.id, slot)}
                       >
                         <span className={`slot-letter ${slot}`}>
@@ -776,7 +1050,9 @@ export function App() {
                     예제로 시작하기
                   </button>
                 </div>
-                <p className="upload-formats">PNG, JPG, WebP · 파일당 20 MB · 최대 50{unit}</p>
+                <p className="upload-formats">
+                  PNG, JPG, WebP · 파일당 20 MB · 최대 50{unit} · {modifier}+V로 붙여넣기
+                </p>
               </div>
             )}
             <div className="queue">
@@ -862,7 +1138,9 @@ export function App() {
                             <strong>{pair.name}</strong>
                             <small>
                               {isSingle
-                                ? "한 장 자동 제거"
+                                ? removesBackground
+                                  ? "한 장 자동 제거"
+                                  : "형식·용량·크기 변환"
                                 : pair.second
                                   ? "이미지 2장"
                                   : "두 번째 이미지 필요"}
@@ -901,7 +1179,7 @@ export function App() {
               <div>
                 <strong>
                   {completed.length
-                    ? `${completed.length}${unit} 완료`
+                    ? `${completed.length}${unit} 완료 · ${allExportFiles.length}개 결과`
                     : "다음 작업을 가볍게 준비하세요"}
                 </strong>
                 <span>
@@ -920,6 +1198,9 @@ export function App() {
                   <button
                     className="primary-button"
                     disabled={!ready.length || Boolean(optionError) || zipping}
+                    aria-label={ready.length ? `${ready.length}${unit} 변환하기` : "변환하기"}
+                    title={`선택 이미지 변환 (${modifier}+Enter)`}
+                    data-tip={`${modifier} Enter`}
                     onClick={() => void convert()}
                   >
                     <Sparkles size={16} />
@@ -929,10 +1210,11 @@ export function App() {
                 <button
                   className="secondary-button"
                   disabled={!selectedDone.length || zipping || busy}
+                  title={`모든 크기를 ZIP으로 저장 (${modifier}+Shift+S)`}
                   onClick={() => void downloadZip(selectedDone)}
                 >
                   {zipping ? <LoaderCircle size={16} className="spin" /> : <FolderDown size={16} />}
-                  선택 ZIP{selectedDone.length ? ` (${selectedDone.length})` : ""}
+                  선택 ZIP{selectedOutputCount ? ` (${selectedOutputCount}개)` : ""}
                 </button>
                 {completed.length > 0 && (
                   <button
@@ -953,6 +1235,8 @@ export function App() {
             onChange={changeSettings}
             disabled={busy || zipping}
             error={optionError}
+            onMessage={setMessage}
+            sourceSize={sourceSize}
           />
         </div>
         {message && (
@@ -981,7 +1265,9 @@ export function App() {
             <p>
               {isSingle ? "PNG, JPG, WebP를 한 번에." : "피사체와 크기는 그대로."}
               <br />
-              {isSingle ? "한 장마다 하나의 결과를 만들어요." : "흰색·검정 배경 조합을 추천해요."}
+              {isSingle
+                ? "붙여넣기와 여러 장 업로드를 지원해요."
+                : "흰색·검정 배경 조합을 추천해요."}
             </p>
           </div>
           <div className="guide-step">
@@ -997,7 +1283,7 @@ export function App() {
               {isSingle
                 ? removesBackground
                   ? "첫 실행에 무료 모델을 내려받아요."
-                  : "PNG·WebP는 무손실로 저장해요."
+                  : "압축·크기를 정하거나 프리셋을 골라요."
                 : "이름의 -white / -black으로 연결해요."}
               <br />
               {isSingle
@@ -1056,6 +1342,7 @@ export function App() {
           e.target.value = "";
         }}
       />
+      <Shortcuts open={shortcuts} onClose={() => setShortcuts(false)} modifier={modifier} />
       <dialog
         ref={guideRef}
         className="guide-dialog"
@@ -1077,7 +1364,7 @@ export function App() {
         <p>
           {isSingle
             ? !removesBackground
-              ? "기본은 배경 제거 꺼짐이에요. 파일을 올리고 저장 형식을 선택하면 돼요. PNG·WebP는 디코딩한 픽셀 기준 무손실이며, JPG는 손실 압축이에요."
+              ? "기본은 배경 제거 꺼짐이에요. 파일을 올리고 저장 형식을 선택하면 돼요. PNG·WebP의 무손실 옵션은 디코딩한 픽셀을 보존해요. 품질 조절 압축과 크기 변경은 픽셀이 달라져요. JPG는 손실 압축이에요."
               : "무료 BRIA 모델이 브라우저에서 피사체를 찾아요. 토큰이나 API 키가 필요 없고, 원본 사진은 외부로 보내지 않아요."
             : "unbg는 서로 다른 단색 배경 위의 같은 피사체를 비교해서 투명도를 복원해요. 이 모드에서는 같은 크기의 두 장이 필요해요."}
         </p>
@@ -1105,7 +1392,7 @@ export function App() {
             <span>
               {isSingle
                 ? !removesBackground
-                  ? "형식만 변환할 때는 AI 모델을 다운로드하지 않아요. 같은 형식을 선택하면 원본 파일을 재압축 없이 저장해요."
+                  ? "형식만 변환할 때는 AI 모델을 다운로드하지 않아요. 압축과 크기 조절을 끄고 같은 형식을 선택하면 원본 그대로 저장해요."
                   : "첫 사용 시 모델 약 42 MB와 실행 파일 약 13 MB를 다운로드해요. 브라우저 캐시가 유지되면 다음에는 재사용해요."
                 : "피사체 위치·크기·조명은 같게, 배경색만 바꿔 주세요."}
             </span>

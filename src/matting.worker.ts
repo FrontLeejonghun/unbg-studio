@@ -1,8 +1,9 @@
 import { cropContent, cropTransparent, differenceMatting } from "unbg/core";
 import type { RgbaImage } from "unbg/core";
 import { getOptions } from "@/model";
-import { encodeImage, readPixels } from "@/image-codec";
-import type { WorkerRequest, WorkerResponse, Output } from "@/model";
+import { encodeImage, readPixels, resizeImage } from "@/image-codec";
+import { exportPlan } from "@/export-plan";
+import type { WorkerRequest, WorkerResponse, Output, OutputVariant } from "@/model";
 const port = self as unknown as {
   onmessage: ((event: MessageEvent<WorkerRequest>) => void) | null;
   postMessage: (response: WorkerResponse) => void;
@@ -25,7 +26,7 @@ async function decode(file: File, opaque: boolean, allowAnimatedPng = false): Pr
       if (length > bytes.byteLength - offset - 12) break;
       if (view.getUint32(offset + 4) === 0x6163544c)
         throw new Error(
-          "움직이는 PNG는 변환·배경 제거를 지원하지 않아요. 배경 제거를 끄고 PNG를 선택하면 원본 그대로 저장해요.",
+          "움직이는 PNG는 변환·배경 제거를 지원하지 않아요. 배경 제거·압축·크기 조절을 끄고 PNG, 1×를 선택해 주세요.",
         );
       offset += length + 12;
     }
@@ -62,17 +63,29 @@ port.onmessage = async ({ data: { first, second, settings } }) => {
     const a = await decode(
       first,
       settings.mode === "pair",
-      settings.mode === "convert" && settings.format === "png",
+      settings.mode === "convert" &&
+        settings.format === "png" &&
+        settings.compression === "off" &&
+        settings.resizeMode === "off" &&
+        settings.scales.length === 1 &&
+        settings.scales[0] === 1,
     );
+    const signature = new Uint8Array(await first.slice(0, 12).arrayBuffer());
+    const inputFormat = signature[0] === 137 ? "png" : signature[0] === 255 ? "jpg" : "webp";
     let matte: RgbaImage;
     let metadata: Pick<
       Output,
       "background1" | "background2" | "backgroundDistance" | "cropClippingThreshold" | "engine"
     > = { cropClippingThreshold: null };
     if (settings.mode === "convert") {
-      const signature = new Uint8Array(await first.slice(0, 12).arrayBuffer());
-      const inputFormat = signature[0] === 137 ? "png" : signature[0] === 255 ? "jpg" : "webp";
-      if (inputFormat === settings.format) {
+      const plan = exportPlan(a.width, a.height, settings);
+      if (
+        inputFormat === settings.format &&
+        settings.compression === "off" &&
+        plan.length === 1 &&
+        plan[0].width === a.width &&
+        plan[0].height === a.height
+      ) {
         port.postMessage({
           type: "result",
           ok: true,
@@ -119,14 +132,41 @@ port.onmessage = async ({ data: { first, second, settings } }) => {
         : settings.mode !== "convert" && settings.cropMode === "threshold"
           ? cropTransparent(matte, settings.cropThreshold)
           : matte;
-    const blob = await encodeImage(result, settings);
+    const variants: OutputVariant[] = [];
+    for (const size of exportPlan(result.width, result.height, settings)) {
+      port.postMessage({
+        type: "progress",
+        progress: { message: `${size.width} × ${size.height} 이미지 저장 중…` },
+      });
+      const resized = resizeImage(result, size.width, size.height);
+      let blob = await encodeImage(resized, settings);
+      const originalKept =
+        settings.mode === "convert" &&
+        inputFormat === settings.format &&
+        resized === result &&
+        blob.size >= first.size;
+      if (originalKept) blob = first;
+      variants.push({ ...size, blob, originalKept });
+    }
+    const primary = variants.find((variant) => variant.scale === 1) ?? variants[0];
+    metadata.engine = [
+      settings.mode === "convert" ? "형식 변환" : (metadata.engine ?? "unbg 배경 제거"),
+      settings.compression === "lossy" || settings.format === "jpg" ? "손실 압축" : "무손실 인코딩",
+      settings.resizeMode !== "off" || settings.scales.some((scale) => scale !== 1)
+        ? "크기 조절 적용"
+        : "원본 크기",
+      variants.some((variant) => variant.originalKept) ? "더 작은 원본 유지" : "",
+    ]
+      .filter(Boolean)
+      .join(" · ");
     port.postMessage({
       type: "result",
       ok: true,
       output: {
-        blob,
-        width: result.width,
-        height: result.height,
+        blob: primary.blob,
+        width: primary.width,
+        height: primary.height,
+        variants,
         ...metadata,
         durationMs: Math.round(performance.now() - startedAt),
       },
@@ -147,7 +187,11 @@ port.onmessage = async ({ data: { first, second, settings } }) => {
       )
     )
       message =
-        "모델을 내려받지 못했어요. 인터넷 연결이나 다운로드 차단을 확인한 뒤 다시 시도해 주세요.";
+        settings.mode === "ai"
+          ? "모델을 내려받지 못했어요. 인터넷 연결이나 다운로드 차단을 확인한 뒤 다시 시도해 주세요."
+          : "변환에 필요한 파일을 내려받지 못했어요. 인터넷 연결을 확인하고 새로고침해 주세요.";
+    if (/Aborted|CompileError|WebAssembly|Encoding error/i.test(message))
+      message = "이미지 처리 모듈을 실행하지 못했어요. 새로고침한 뒤 다시 시도해 주세요.";
     port.postMessage({
       type: "result",
       ok: false,

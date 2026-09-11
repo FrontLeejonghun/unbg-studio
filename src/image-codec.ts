@@ -61,13 +61,16 @@ export async function readPixels(file: File, canvasPixels: RgbaImage): Promise<R
 
 export async function encodeImage(image: RgbaImage, settings: Settings): Promise<Blob> {
   if (settings.format === "png") {
-    const bytes = encodePng({
-      width: image.width,
-      height: image.height,
-      data: image.data,
-      channels: 4,
-      depth: 8,
-    });
+    const bytes = encodePng(
+      {
+        width: image.width,
+        height: image.height,
+        data: image.data,
+        channels: 4,
+        depth: 8,
+      },
+      { zlib: { level: settings.compression === "lossless" ? 9 : 3 } },
+    );
     return new Blob([new Uint8Array(bytes)], { type: "image/png" });
   }
   if (settings.format === "webp") {
@@ -75,11 +78,11 @@ export async function encodeImage(image: RgbaImage, settings: Settings): Promise
     const bytes = await encode(
       new ImageData(new Uint8ClampedArray(image.data), image.width, image.height),
       {
-        lossless: 1,
+        lossless: settings.compression === "lossy" ? 0 : 1,
         near_lossless: 100,
-        quality: 100,
+        quality: settings.compression === "lossy" ? settings.webpQuality : 100,
         exact: 1,
-        method: 4,
+        method: settings.compression === "lossless" ? 6 : 4,
       },
     );
     return new Blob([bytes], { type: "image/webp" });
@@ -102,4 +105,26 @@ export async function encodeImage(image: RgbaImage, settings: Settings): Promise
   if (blob.type !== "image/jpeg")
     throw new Error("이 브라우저는 JPG 저장을 지원하지 않아요. PNG를 선택해 주세요.");
   return blob;
+}
+
+export function resizeImage(image: RgbaImage, width: number, height: number): RgbaImage {
+  if (width === image.width && height === image.height) return image;
+  const source = new OffscreenCanvas(image.width, image.height);
+  const sourceContext = source.getContext("2d");
+  const canvas = new OffscreenCanvas(width, height);
+  const context = canvas.getContext("2d");
+  if (!sourceContext || !context)
+    throw new Error("크기를 변경할 수 없어요. 최신 브라우저에서 다시 시도해 주세요.");
+  sourceContext.putImageData(
+    new ImageData(new Uint8ClampedArray(image.data), image.width, image.height),
+    0,
+    0,
+  );
+  context.imageSmoothingEnabled = true;
+  context.imageSmoothingQuality = "high";
+  context.drawImage(source, 0, 0, width, height);
+  const data = new Uint8Array(context.getImageData(0, 0, width, height).data);
+  source.width = source.height = 1;
+  canvas.width = canvas.height = 1;
+  return { data, width, height };
 }
