@@ -35,7 +35,7 @@ import {
   outputNames,
   pairFiles,
 } from "@/model";
-import type { Asset, Pair, Settings, WorkerResponse, Output } from "@/model";
+import type { Asset, Pair, Settings, WorkerResponse, Output, ProcessingProgress } from "@/model";
 const DEMO_URL = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(DEMO_SVG)}`;
 const STATUS_MAP = { idle: "변환 대기", processing: "변환 중", done: "완료", error: "확인 필요" };
 function dispose(pair: Pair) {
@@ -47,7 +47,11 @@ export function App() {
   const [pairs, setPairs] = useState<Pair[]>([]);
   const [settings, setSettings] = useState<Settings>({ ...DEFAULT_SETTINGS });
   const [activeId, setActiveId] = useState("");
+  const [progress, setProgress] = useState<ProcessingProgress | null>(null);
+  const workerRef = useRef<Worker | null>(null);
   const [busy, setBusy] = useState(false);
+  const [demoLoading, setDemoLoading] = useState(false);
+  const demoPendingRef = useRef(false);
   const [zipping, setZipping] = useState(false);
   const [message, setMessage] = useState("");
   const [dragging, setDragging] = useState(false);
@@ -73,6 +77,7 @@ export function App() {
     () => () => {
       runningRef.current = false;
       abortRef.current?.();
+      workerRef.current?.terminate();
       pairsRef.current.forEach(dispose);
     },
     [],
@@ -85,8 +90,12 @@ export function App() {
   const completed = pairs.filter((p) => p.output);
   const selected = pairs.filter((p) => p.selected);
   const selectedDone = selected.filter((p) => p.output);
-  const ready = selected.filter((p) => p.first && p.second && p.status !== "done");
-  const names = outputNames(pairs, settings.suffix);
+  const isSingle = settings.mode !== "pair";
+  const removesBackground = settings.mode !== "convert";
+  const formatLabel = settings.format === "webp" ? "WebP" : settings.format.toUpperCase();
+  const unit = isSingle ? "장" : "쌍";
+  const ready = selected.filter((p) => p.first && (isSingle || p.second) && p.status !== "done");
+  const names = outputNames(pairs, settings.suffix, settings.format);
   const visible = pairs.filter((p) => filter === "all" || p.status === filter);
   let optionError = "";
   try {
@@ -128,10 +137,12 @@ export function App() {
       size += file.size;
       count++;
     }
-    const grouped = pairFiles(accepted);
+    const grouped = isSingle
+      ? accepted.map((first) => ({ name: cleanName(first.name), first, second: undefined }))
+      : pairFiles(accepted);
     const remaining = Math.max(0, 50 - pairsRef.current.length);
     if (grouped.length > remaining)
-      errors.push("최대 50쌍까지 추가할 수 있어요. 기존 작업을 저장한 뒤 비워 주세요.");
+      errors.push(`최대 50${unit}까지 추가할 수 있어요. 기존 작업을 저장한 뒤 비워 주세요.`);
     const additions: Pair[] = grouped.slice(0, remaining).map((p) => ({
       id: crypto.randomUUID(),
       name: p.name,
@@ -147,27 +158,46 @@ export function App() {
       errors.length
         ? errors.slice(0, 3).join(" ")
         : additions.length
-          ? `${accepted.length}개 파일을 ${additions.length}쌍으로 추가했어요. A와 B가 같은 피사체인지 확인해 주세요.`
+          ? isSingle
+            ? `${additions.length}장을 추가했어요. ${removesBackground ? "변환하기를 누르면 자동으로 배경을 제거해요." : "배경은 유지하고 선택한 형식으로 저장해요."}`
+            : `${accepted.length}개 파일을 ${additions.length}쌍으로 추가했어요. A와 B가 같은 피사체인지 확인해 주세요.`
           : "",
     );
   }
   async function useDemo() {
+    if (runningRef.current || demoPendingRef.current) return;
+    demoPendingRef.current = true;
+    setDemoLoading(true);
     try {
-      addFiles(await createDemoFiles());
+      addFiles(await createDemoFiles(isSingle));
     } catch {
       setMessage("예제를 불러오지 못했어요. 다시 시도해 주세요.");
+    } finally {
+      demoPendingRef.current = false;
+      setDemoLoading(false);
     }
   }
   function changeSettings(next: Settings) {
     if (runningRef.current) return;
     const { suffix: previousSuffix, ...previousProcessing } = settings;
     const { suffix: nextSuffix, ...nextProcessing } = next;
+    if (next.mode !== settings.mode) {
+      if (
+        demoPendingRef.current ||
+        (pairsRef.current.length && (next.mode === "pair" || settings.mode === "pair"))
+      )
+        return;
+      setPreviewMode("result");
+      workerRef.current?.terminate();
+      workerRef.current = null;
+    }
     setSettings(next);
     if (
       previousSuffix !== nextSuffix &&
       JSON.stringify(previousProcessing) === JSON.stringify(nextProcessing)
     )
       return;
+    setMessage(pairsRef.current.length ? "옵션이 바뀌었어요. 다시 변환해 주세요." : "");
     updatePairs((old) =>
       old.map((p) => {
         if (p.output) URL.revokeObjectURL(p.output.url);
@@ -222,32 +252,51 @@ export function App() {
   }
   function processPair(pair: Pair): Promise<Output> {
     return new Promise((resolve, reject) => {
-      const worker = new Worker(new URL("./matting.worker.ts", import.meta.url), {
-        type: "module",
-      });
+      const worker =
+        workerRef.current ??
+        new Worker(new URL("./matting.worker.ts", import.meta.url), { type: "module" });
+      workerRef.current = worker;
+      setProgress({ message: "이미지를 준비하고 있어요." });
       let finished = false;
-      const finish = () => {
+      const finish = (terminate = false) => {
         if (finished) return;
         finished = true;
         clearTimeout(timer);
-        worker.terminate();
+        worker.onmessage = null;
+        worker.onerror = null;
+        if (terminate) {
+          worker.terminate();
+          workerRef.current = null;
+        }
         abortRef.current = null;
+        setProgress(null);
       };
-      const timer = setTimeout(() => {
-        finish();
-        reject(new Error("변환 시간이 초과됐어요. 이미지 크기를 줄여 다시 시도해 주세요."));
-      }, 120000);
+      const timer = setTimeout(
+        () => {
+          finish(true);
+          reject(
+            new Error(
+              "처리 시간이 초과됐어요. 인터넷 연결을 확인하거나 이미지 크기를 줄여 다시 시도해 주세요.",
+            ),
+          );
+        },
+        settings.mode === "ai" ? 600000 : 120000,
+      );
       abortRef.current = () => {
-        finish();
+        finish(true);
         reject(new DOMException("중지됨", "AbortError"));
       };
       worker.onmessage = (event: MessageEvent<WorkerResponse>) => {
+        if (event.data.type === "progress") {
+          setProgress(event.data.progress);
+          return;
+        }
         finish();
         if (event.data.ok) resolve(event.data.output);
         else reject(new Error(event.data.error));
       };
       worker.onerror = () => {
-        finish();
+        finish(true);
         reject(new Error("이미지 처리 중 문제가 생겼어요. 최신 브라우저에서 다시 시도해 주세요."));
       };
       worker.postMessage({ first: pair.first?.file, second: pair.second?.file, settings });
@@ -291,7 +340,7 @@ export function App() {
       runningRef.current = false;
       setBusy(false);
       setMessage(
-        `${stopped ? "변환을 중지했어요. " : ""}${successes}쌍 완료${failures ? `, ${failures}쌍은 확인이 필요해요.` : "."} 완료된 결과를 다운로드할 수 있어요.`,
+        `${stopped ? "변환을 중지했어요. " : ""}${successes}${unit} 완료${failures ? `, ${failures}${unit}은 확인이 필요해요.` : "."} ${pairsRef.current.some((pair) => pair.output) ? "완료된 결과를 다운로드할 수 있어요." : "이미지 안내를 확인한 뒤 다시 시도해 주세요."}`,
       );
     }
   }
@@ -306,7 +355,7 @@ export function App() {
       const entries: Record<string, Uint8Array> = {};
       for (const p of targets) {
         if (p.output)
-          entries[names.get(p.id) ?? `${cleanName(p.name)}.png`] = new Uint8Array(
+          entries[names.get(p.id) ?? `${cleanName(p.name)}.${settings.format}`] = new Uint8Array(
             await p.output.blob.arrayBuffer(),
           );
       }
@@ -316,7 +365,7 @@ export function App() {
         ),
       );
       download(new Blob([bytes], { type: "application/zip" }), `unbg-studio-${targets.length}.zip`);
-      setMessage(`${targets.length}개 PNG를 ZIP으로 저장했어요.`);
+      setMessage(`${targets.length}개 ${formatLabel} 파일을 ZIP으로 저장했어요.`);
     } catch {
       setMessage("ZIP을 만들지 못했어요. 선택 개수를 줄이거나 개별 다운로드해 주세요.");
     } finally {
@@ -324,9 +373,13 @@ export function App() {
     }
   }
   function clearAll() {
+    workerRef.current?.terminate();
+    workerRef.current = null;
+    setProgress(null);
     pairsRef.current.forEach(dispose);
     updatePairs([]);
     setActiveId("");
+    setFilter("all");
     setMessage("작업 공간을 비웠어요.");
   }
   const previewUrl = active
@@ -362,12 +415,12 @@ export function App() {
         <section className="intro">
           <div>
             <h1>
-              배경 없이,
-              <br className="mobile-break" /> 가능성은 그대로.
+              원하는 형식으로,
+              <br className="mobile-break" /> 이미지 그대로.
             </h1>
             <p>
-              두 장의 이미지에서 섬세한 투명함을 꺼내세요.
-              <br className="mobile-break" /> 여러 쌍도 한 번에.
+              형식은 바꾸고, 필요할 때 배경도 제거해요.
+              <br className="mobile-break" /> 여러 장도 한 번에. 무료로, 내 브라우저에서.
             </p>
           </div>
           <div className="intro-mark">
@@ -379,13 +432,62 @@ export function App() {
             </span>
           </div>
         </section>
+        <div className="mode-bar">
+          <label className="background-toggle">
+            <input
+              type="checkbox"
+              role="switch"
+              aria-label="배경 제거"
+              checked={removesBackground}
+              disabled={busy || zipping || demoLoading || (!isSingle && pairs.length > 0)}
+              onChange={(event) =>
+                changeSettings({
+                  ...settings,
+                  mode: event.target.checked ? "ai" : "convert",
+                  format:
+                    event.target.checked && settings.format === "jpg" ? "png" : settings.format,
+                })
+              }
+            />
+            <span>배경 제거</span>
+            <strong>{removesBackground ? "켜짐" : "꺼짐"}</strong>
+          </label>
+          {removesBackground && (
+            <div className="segmented" aria-label="배경 제거 방식">
+              <button
+                aria-pressed={isSingle}
+                disabled={busy || zipping || demoLoading || pairs.length > 0}
+                onClick={() => changeSettings({ ...settings, mode: "ai" })}
+              >
+                한 장 자동 제거
+              </button>
+              <button
+                aria-pressed={!isSingle}
+                disabled={busy || zipping || demoLoading || pairs.length > 0}
+                onClick={() => changeSettings({ ...settings, mode: "pair" })}
+              >
+                두 장 비교 · unbg
+              </button>
+            </div>
+          )}
+          <span>
+            {!removesBackground
+              ? "기본은 형식만 변환해요. 모델 다운로드 없이 바로 시작하세요."
+              : !isSingle && pairs.length
+                ? "배경 제거 방식을 바꾸려면 작업 공간을 비워 주세요."
+                : "내 기기에서 처리 · 토큰·API 키 불필요"}
+          </span>
+        </div>
         <div className="workspace">
           <section className="editor">
             <div className="editor-top">
               <div className="workspace-title">
                 <Layers2 size={18} />
                 <h2>작업 공간</h2>
-                <span className="count">{pairs.length}쌍</span>
+                <span className="count">
+                  {pairs.length}
+                  {unit}
+                </span>
               </div>
               <button
                 className="small-button"
@@ -398,14 +500,17 @@ export function App() {
             </div>
             <div className="canvas-toolbar">
               <div className="segmented" aria-label="미리보기 이미지">
-                {(["result", "first", "second"] as const).map((mode, i) => (
+                {(isSingle
+                  ? (["result", "first"] as const)
+                  : (["result", "first", "second"] as const)
+                ).map((mode, i) => (
                   <button
                     key={mode}
                     aria-pressed={previewMode === mode}
                     onClick={() => setPreviewMode(mode)}
                     disabled={!active && mode !== "result"}
                   >
-                    {["변환 결과", "원본 A", "원본 B"][i]}
+                    {["변환 결과", isSingle ? "원본" : "원본 A", "원본 B"][i]}
                   </button>
                 ))}
               </div>
@@ -485,20 +590,51 @@ export function App() {
                   )}
                   <h3>
                     {active?.status === "processing"
-                      ? "투명함을 꺼내고 있어요"
+                      ? removesBackground
+                        ? "배경을 제거하고 있어요"
+                        : "이미지 형식을 바꾸고 있어요"
                       : active?.error
                         ? "이미지를 확인해 주세요"
-                        : !active?.second
+                        : !isSingle && !active?.second
                           ? "두 번째 이미지를 추가해 주세요"
                           : "변환 준비가 되었어요"}
                   </h3>
-                  <p>{active?.error ?? "아래에서 원본 두 장을 확인하고 변환을 시작하세요."}</p>
+                  <p role={active?.status === "processing" ? "status" : undefined}>
+                    {active?.error ??
+                      (active?.status === "processing"
+                        ? progress?.message
+                        : isSingle
+                          ? removesBackground
+                            ? "변환하기를 누르면 이 이미지의 배경을 자동으로 제거해요."
+                            : `${formatLabel}로 변환할 준비가 되었어요. 배경과 크기는 그대로예요.`
+                          : "아래에서 원본 두 장을 확인하고 변환을 시작하세요.")}
+                  </p>
+                  {active?.status === "processing" && progress?.percent !== undefined && (
+                    <progress
+                      aria-label="모델 다운로드 진행률"
+                      value={progress.percent}
+                      max={100}
+                    />
+                  )}
+                  {active?.status === "processing" && settings.mode === "ai" && (
+                    <small>이미지는 전송되지 않아요. 이 화면을 열어 두세요.</small>
+                  )}
                 </div>
               )}
               {!active && (
                 <>
-                  <span className="sample-chip">투명도, 부드러운 경계까지 보존</span>
-                  <span className="canvas-bottom-label">실제 변환 가능한 예제</span>
+                  <span className="sample-chip">
+                    {isSingle
+                      ? removesBackground
+                        ? "한 장으로 간편하게, 투명 이미지"
+                        : "이미지는 그대로, 형식은 자유롭게"
+                      : "투명도, 부드러운 경계까지 보존"}
+                  </span>
+                  <span className="canvas-bottom-label">
+                    {isSingle
+                      ? "완성 이미지 예시 · 아래에서 직접 변환해 보세요"
+                      : "실제 변환 가능한 예제"}
+                  </span>
                 </>
               )}
               {active?.output && (
@@ -512,11 +648,14 @@ export function App() {
                     className="small-button"
                     onClick={() =>
                       active.output &&
-                      download(active.output.blob, names.get(active.id) ?? "image.png")
+                      download(
+                        active.output.blob,
+                        names.get(active.id) ?? `image.${settings.format}`,
+                      )
                     }
                   >
                     <ArrowDownToLine size={14} />
-                    PNG 저장
+                    {formatLabel} 저장
                   </button>
                 </div>
               )}
@@ -524,7 +663,7 @@ export function App() {
                 <div className="drop-overlay">
                   <Upload size={35} />
                   <strong>여기에 이미지를 놓아 주세요</strong>
-                  <span>여러 쌍을 한 번에 추가할 수 있어요</span>
+                  <span>여러 이미지를 한 번에 추가할 수 있어요</span>
                 </div>
               )}
             </div>
@@ -533,59 +672,80 @@ export function App() {
                 <label className="output-name">
                   저장할 이름
                   <input
-                    aria-label="선택한 쌍 저장 이름"
+                    aria-label="선택한 이미지 저장 이름"
                     value={active.name}
                     maxLength={120}
                     disabled={busy || zipping}
                     onChange={(e) => patch(active.id, { name: e.target.value })}
                   />
-                  <span>.png</span>
+                  <span>.{settings.format}</span>
                 </label>
-                <div className="pair-sources">
-                  {(["first", "second"] as const).map((slot, index) => (
-                    <button
-                      key={slot}
-                      className="source-slot"
-                      disabled={busy}
-                      onClick={() => requestReplace(active.id, slot)}
-                    >
-                      <span className={`slot-letter ${slot}`}>{index === 0 ? "A" : "B"}</span>
-                      {active[slot] ? (
-                        <img src={active[slot].url} alt="" />
-                      ) : (
-                        <ImagePlus size={22} />
-                      )}
-                      <span>
-                        <strong>{active[slot]?.file.name ?? "이미지 추가"}</strong>
-                        <small>
-                          {active[slot]
-                            ? `${fileSize(active[slot].file.size)} · 눌러서 교체`
-                            : "같은 피사체, 다른 단색 배경"}
-                        </small>
-                      </span>
-                      <Plus size={14} />
-                    </button>
-                  ))}
+                <div className={`pair-sources ${isSingle ? "single-source" : ""}`}>
+                  {(isSingle ? (["first"] as const) : (["first", "second"] as const)).map(
+                    (slot, index) => (
+                      <button
+                        key={slot}
+                        className="source-slot"
+                        disabled={busy}
+                        onClick={() => requestReplace(active.id, slot)}
+                      >
+                        <span className={`slot-letter ${slot}`}>
+                          {isSingle ? "1" : index === 0 ? "A" : "B"}
+                        </span>
+                        {active[slot] ? (
+                          <img src={active[slot].url} alt="" />
+                        ) : (
+                          <ImagePlus size={22} />
+                        )}
+                        <span>
+                          <strong>{active[slot]?.file.name ?? "이미지 추가"}</strong>
+                          <small>
+                            {active[slot]
+                              ? `${fileSize(active[slot].file.size)} · 눌러서 교체`
+                              : "같은 피사체, 다른 단색 배경"}
+                          </small>
+                        </span>
+                        <Plus size={14} />
+                      </button>
+                    ),
+                  )}
                 </div>
-                {active.output && (
-                  <div
-                    className={`result-info ${active.output.backgroundDistance < 50 ? "warning" : ""}`}
-                  >
+                {active.output?.engine && (
+                  <div className="result-info">
                     <span>
-                      감지한 배경 <i style={{ background: colorHex(active.output.background1) }} />
-                      {colorHex(active.output.background1)}
-                      <i style={{ background: colorHex(active.output.background2) }} />
-                      {colorHex(active.output.background2)}
+                      {active.output.engine} · {(active.output.durationMs / 1000).toFixed(1)}초 · 내
+                      기기에서 처리 완료
                     </span>
-                    <span>
-                      배경색 거리 {active.output.backgroundDistance.toFixed(1)}
-                      {active.output.backgroundDistance < 50 ? " · 더 다른 배경색을 권장해요" : ""}
-                    </span>
-                    {active.output.cropClippingThreshold !== null && (
-                      <span>경계 손실 시작 {active.output.cropClippingThreshold.toFixed(3)}</span>
+                    {removesBackground && (
+                      <span>사진에 따라 미세한 경계나 반투명 부분은 다를 수 있어요.</span>
                     )}
                   </div>
                 )}
+                {active.output &&
+                  active.output.background1 &&
+                  active.output.background2 &&
+                  active.output.backgroundDistance !== undefined && (
+                    <div
+                      className={`result-info ${active.output.backgroundDistance < 50 ? "warning" : ""}`}
+                    >
+                      <span>
+                        감지한 배경{" "}
+                        <i style={{ background: colorHex(active.output.background1) }} />
+                        {colorHex(active.output.background1)}
+                        <i style={{ background: colorHex(active.output.background2) }} />
+                        {colorHex(active.output.background2)}
+                      </span>
+                      <span>
+                        배경색 거리 {active.output.backgroundDistance.toFixed(1)}
+                        {active.output.backgroundDistance < 50
+                          ? " · 더 다른 배경색을 권장해요"
+                          : ""}
+                      </span>
+                      {active.output.cropClippingThreshold !== null && (
+                        <span>경계 손실 시작 {active.output.cropClippingThreshold.toFixed(3)}</span>
+                      )}
+                    </div>
+                  )}
               </div>
             ) : (
               <div className="upload-start">
@@ -595,7 +755,11 @@ export function App() {
                   </span>
                   <div>
                     <h3>이미지들을 놓으면, 준비 끝.</h3>
-                    <p>같은 피사체에 배경만 다른 2장씩 준비해 주세요.</p>
+                    <p>
+                      {isSingle
+                        ? "사진 한 장도, 여러 장도 그대로 올려 주세요."
+                        : "같은 피사체에 배경만 다른 2장씩 준비해 주세요."}
+                    </p>
                   </div>
                 </div>
                 <div className="upload-actions">
@@ -603,12 +767,16 @@ export function App() {
                     <Plus size={17} />
                     이미지 선택
                   </button>
-                  <button className="text-button" onClick={() => void useDemo()}>
+                  <button
+                    className="text-button"
+                    disabled={demoLoading}
+                    onClick={() => void useDemo()}
+                  >
                     <Sparkles size={14} />
                     예제로 시작하기
                   </button>
                 </div>
-                <p className="upload-formats">PNG, JPG, WebP · 파일당 20 MB · 최대 50쌍</p>
+                <p className="upload-formats">PNG, JPG, WebP · 파일당 20 MB · 최대 50{unit}</p>
               </div>
             )}
             <div className="queue">
@@ -659,7 +827,10 @@ export function App() {
                       />
                       전체 선택
                     </label>
-                    <span>{selected.length}쌍 선택</span>
+                    <span>
+                      {selected.length}
+                      {unit} 선택
+                    </span>
                   </div>
                   <div className="pair-list">
                     {visible.map((pair, index) => (
@@ -684,11 +855,18 @@ export function App() {
                           <span className="pair-index">{String(index + 1).padStart(2, "0")}</span>
                           <span className="pair-thumbnails">
                             {pair.first && <img src={pair.first.url} alt="" />}
-                            {pair.second ? <img src={pair.second.url} alt="" /> : <span>?</span>}
+                            {!isSingle &&
+                              (pair.second ? <img src={pair.second.url} alt="" /> : <span>?</span>)}
                           </span>
                           <span className="pair-title">
                             <strong>{pair.name}</strong>
-                            <small>{pair.second ? "이미지 2장" : "두 번째 이미지 필요"}</small>
+                            <small>
+                              {isSingle
+                                ? "한 장 자동 제거"
+                                : pair.second
+                                  ? "이미지 2장"
+                                  : "두 번째 이미지 필요"}
+                            </small>
                           </span>
                           <span className={`status ${pair.status}`}>
                             {pair.status === "processing" ? (
@@ -710,14 +888,12 @@ export function App() {
                       </div>
                     ))}
                   </div>
-                  {!visible.length && (
-                    <div className="queue-empty">이 상태의 이미지 쌍이 없어요.</div>
-                  )}
+                  {!visible.length && <div className="queue-empty">이 상태의 이미지가 없어요.</div>}
                 </>
               ) : (
                 <div className="queue-empty">
                   <FileImage size={17} />
-                  추가한 이미지 쌍이 여기에 표시돼요.
+                  추가한 이미지가 여기에 표시돼요.
                 </div>
               )}
             </div>
@@ -725,13 +901,13 @@ export function App() {
               <div>
                 <strong>
                   {completed.length
-                    ? `${completed.length}쌍 완료`
-                    : "투명한 다음 장면을 준비하세요"}
+                    ? `${completed.length}${unit} 완료`
+                    : "다음 작업을 가볍게 준비하세요"}
                 </strong>
                 <span>
                   {busy
-                    ? "기기에서 순서대로 변환하고 있어요."
-                    : "완성된 결과는 원본 해상도의 PNG로 저장해요."}
+                    ? (progress?.message ?? "기기에서 순서대로 변환하고 있어요.")
+                    : `완성된 결과는 ${formatLabel}로 저장해요.${!removesBackground ? " 배경 제거 꺼짐" : ""}`}
                 </span>
               </div>
               <div className="action-buttons">
@@ -747,7 +923,7 @@ export function App() {
                     onClick={() => void convert()}
                   >
                     <Sparkles size={16} />
-                    {ready.length ? `${ready.length}쌍 변환하기` : "변환하기"}
+                    {ready.length ? `${ready.length}${unit} 변환하기` : "변환하기"}
                   </button>
                 )}
                 <button
@@ -790,9 +966,9 @@ export function App() {
         <section className="workflow-guide">
           <div className="guide-title">
             <h2>
-              두 장에서 시작하는
+              가볍게 시작하는
               <br />
-              깨끗한 투명 배경.
+              편리한 이미지 변환.
             </h2>
             <button className="text-button" onClick={() => setGuide(true)}>
               처음이라면 가이드 보기
@@ -801,26 +977,41 @@ export function App() {
           </div>
           <div className="guide-step">
             <span>1</span>
-            <h3>배경만 다르게 준비</h3>
+            <h3>{isSingle ? "사진을 그대로 올리기" : "배경만 다르게 준비"}</h3>
             <p>
-              피사체와 크기는 그대로.
+              {isSingle ? "PNG, JPG, WebP를 한 번에." : "피사체와 크기는 그대로."}
               <br />
-              흰색·검정 배경 조합을 추천해요.
+              {isSingle ? "한 장마다 하나의 결과를 만들어요." : "흰색·검정 배경 조합을 추천해요."}
             </p>
           </div>
           <div className="guide-step">
             <span>2</span>
-            <h3>여러 쌍을 한 번에</h3>
+            <h3>
+              {isSingle
+                ? removesBackground
+                  ? "브라우저에서 자동 제거"
+                  : "원하는 형식 선택"
+                : "여러 쌍을 한 번에"}
+            </h3>
             <p>
-              이름의 -white / -black으로 연결해요.
-              <br />그 외 파일은 이름순으로 2장씩 묶어요.
+              {isSingle
+                ? removesBackground
+                  ? "첫 실행에 무료 모델을 내려받아요."
+                  : "PNG·WebP는 무손실로 저장해요."
+                : "이름의 -white / -black으로 연결해요."}
+              <br />
+              {isSingle
+                ? removesBackground
+                  ? "이후에는 저장된 모델을 재사용해요."
+                  : "필요할 때만 배경 제거를 켜세요."
+                : "그 외 파일은 이름순으로 2장씩 묶어요."}
             </p>
           </div>
           <div className="guide-step">
             <span>3</span>
             <h3>변환하고, 가져가기</h3>
             <p>
-              결과를 확인하고 PNG 또는 ZIP 저장.
+              결과를 확인하고 개별 또는 ZIP 저장.
               <br />
               파일은 내 기기 밖으로 나가지 않아요.
             </p>
@@ -834,8 +1025,11 @@ export function App() {
           이미지 전송 없음
         </span>
         <a href="https://github.com/privatenumber/unbg" target="_blank" rel="noreferrer">
-          Powered by unbg
+          unbg
           <ArrowRight size={12} />
+        </a>
+        <a href="https://huggingface.co/briaai/RMBG-1.4" target="_blank" rel="noreferrer">
+          BRIA · 개인·비상업용
         </a>
       </footer>
       <input
@@ -854,7 +1048,7 @@ export function App() {
         className="sr-only"
         ref={replaceRef}
         type="file"
-        aria-label="쌍 이미지 교체"
+        aria-label="원본 이미지 교체"
         accept=".png,.jpg,.jpeg,.webp"
         onChange={(e) => {
           const file = e.target.files?.[0];
@@ -877,44 +1071,61 @@ export function App() {
             <X size={21} />
           </button>
         </div>
-        <h2 id="guide-title">좋은 결과는, 잘 맞는 두 장에서.</h2>
+        <h2 id="guide-title">
+          {isSingle ? "형식 변환부터, 배경 제거까지." : "좋은 결과는, 잘 맞는 두 장에서."}
+        </h2>
         <p>
-          unbg는 서로 다른 단색 배경 위의 같은 피사체를 비교해서 투명도를 복원해요. 한 장의
-          사진만으로는 변환할 수 없어요.
+          {isSingle
+            ? !removesBackground
+              ? "기본은 배경 제거 꺼짐이에요. 파일을 올리고 저장 형식을 선택하면 돼요. PNG·WebP는 디코딩한 픽셀 기준 무손실이며, JPG는 손실 압축이에요."
+              : "무료 BRIA 모델이 브라우저에서 피사체를 찾아요. 토큰이나 API 키가 필요 없고, 원본 사진은 외부로 보내지 않아요."
+            : "unbg는 서로 다른 단색 배경 위의 같은 피사체를 비교해서 투명도를 복원해요. 이 모드에서는 같은 크기의 두 장이 필요해요."}
         </p>
-        <div className="guide-example">
-          <div style={{ background: "#fff" }}>
-            <img src={DEMO_URL} alt="흰색 배경 예제" />
-            <span>원본 A</span>
+        {!isSingle && (
+          <div className="guide-example">
+            <div style={{ background: "#fff" }}>
+              <img src={DEMO_URL} alt="흰색 배경 예제" />
+              <span>원본 A</span>
+            </div>
+            <Plus size={19} />
+            <div style={{ background: "#252735" }}>
+              <img src={DEMO_URL} alt="검정 배경 예제" />
+              <span>원본 B</span>
+            </div>
+            <ArrowRight size={19} />
+            <div className="checker">
+              <img src={DEMO_URL} alt="투명 배경 결과" />
+              <span>투명 PNG</span>
+            </div>
           </div>
-          <Plus size={19} />
-          <div style={{ background: "#252735" }}>
-            <img src={DEMO_URL} alt="검정 배경 예제" />
-            <span>원본 B</span>
-          </div>
-          <ArrowRight size={19} />
-          <div className="checker">
-            <img src={DEMO_URL} alt="투명 배경 결과" />
-            <span>투명 PNG</span>
-          </div>
-        </div>
+        )}
         <ul>
           <li>
             <MousePointer2 size={17} />
-            <span>피사체 위치·크기·조명은 같게, 배경색만 바꿔 주세요.</span>
+            <span>
+              {isSingle
+                ? !removesBackground
+                  ? "형식만 변환할 때는 AI 모델을 다운로드하지 않아요. 같은 형식을 선택하면 원본 파일을 재압축 없이 저장해요."
+                  : "첫 사용 시 모델 약 42 MB와 실행 파일 약 13 MB를 다운로드해요. 브라우저 캐시가 유지되면 다음에는 재사용해요."
+                : "피사체 위치·크기·조명은 같게, 배경색만 바꿔 주세요."}
+            </span>
           </li>
           <li>
             <Layers2 size={17} />
             <span>
-              flower-white.png + flower-black.png처럼 이름을 맞추면 자동으로 연결돼요. 연결 후 A/B
-              이미지를 눌러 교체할 수도 있어요.
+              {isSingle
+                ? "최대 50장을 순서대로 처리해요. 속도는 기기 성능에 따라 다르고, 브라우저 안에서 CPU로 실행해요."
+                : "flower-white.png + flower-black.png처럼 이름을 맞추면 자동으로 연결돼요. 연결 후 A/B 이미지를 눌러 교체할 수도 있어요."}
             </span>
           </li>
           <li>
             <FileImage size={17} />
             <span>
-              무손실 PNG가 가장 깨끗해요. JPG·WebP 압축 흔적은 결과에 남을 수 있어요. 투명 원본과
-              움직이는 WebP는 지원하지 않아요.
+              {isSingle
+                ? !removesBackground
+                  ? "무손실은 8-bit 픽셀 기준이에요. 형식이 달라지면 ICC 색상 프로필·EXIF 등 메타데이터는 보존하지 않아요. 16-bit PNG는 PNG로 원본 저장해 주세요. JPG로 바꾸면 투명한 부분은 흰색이 돼요."
+                  : "모델은 1,024 × 1,024 크기로 피사체를 판단하고, 결과는 원본 크기로 저장해요. 머리카락·유리·반투명 그래픽은 직접 경계를 확인해 주세요. 움직이는 WebP는 지원하지 않아요."
+                : "무손실 PNG가 가장 깨끗해요. JPG·WebP 압축 흔적은 결과에 남을 수 있어요. 투명 원본과 움직이는 WebP는 지원하지 않아요."}
             </span>
           </li>
           <li>
@@ -927,6 +1138,7 @@ export function App() {
         </ul>
         <button
           className="primary-button"
+          disabled={busy || demoLoading}
           onClick={() => {
             setGuide(false);
             void useDemo();

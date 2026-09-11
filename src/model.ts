@@ -1,5 +1,8 @@
 import type { DifferenceMattingOptions, Rgb } from "unbg/core";
 export type Settings = {
+  mode: "convert" | "ai" | "pair";
+  format: "png" | "webp" | "jpg";
+  jpegQuality: number;
   background1: string;
   background2: string;
   channelThreshold: number;
@@ -10,6 +13,9 @@ export type Settings = {
   suffix: string;
 };
 export const DEFAULT_SETTINGS: Settings = {
+  mode: "convert",
+  format: "png",
+  jpegQuality: 95,
   background1: "",
   background2: "",
   channelThreshold: 10,
@@ -17,16 +23,18 @@ export const DEFAULT_SETTINGS: Settings = {
   ceiling: 1,
   cropMode: "off",
   cropThreshold: 0.02,
-  suffix: "-transparent",
+  suffix: "-converted",
 };
 export type Asset = { file: File; url: string };
 export type Output = {
   blob: Blob;
   width: number;
   height: number;
-  background1: Rgb;
-  background2: Rgb;
-  backgroundDistance: number;
+  background1?: Rgb;
+  background2?: Rgb;
+  backgroundDistance?: number;
+  engine?: string;
+  durationMs: number;
   cropClippingThreshold: number | null;
 };
 export type Pair = {
@@ -39,8 +47,12 @@ export type Pair = {
   output?: Output & { url: string };
   error?: string;
 };
-export type WorkerRequest = { first: File; second: File; settings: Settings };
-export type WorkerResponse = { ok: true; output: Output } | { ok: false; error: string };
+export type WorkerRequest = { first: File; second?: File; settings: Settings };
+export type ProcessingProgress = { message: string; percent?: number };
+export type WorkerResponse =
+  | { type: "progress"; progress: ProcessingProgress }
+  | { type: "result"; ok: true; output: Output }
+  | { type: "result"; ok: false; error: string };
 export function parseColor(value: string): Rgb | undefined {
   if (!value.trim()) return undefined;
   const hex = /^#?([\da-f]{6})$/i.exec(value.trim());
@@ -60,6 +72,15 @@ export function parseColor(value: string): Rgb | undefined {
   throw new Error("배경색은 #ffffff 또는 255,255,255 형식으로 입력해 주세요.");
 }
 export function getOptions(settings: Settings): DifferenceMattingOptions {
+  if (
+    !Number.isFinite(settings.jpegQuality) ||
+    settings.jpegQuality < 1 ||
+    settings.jpegQuality > 100
+  )
+    throw new Error("JPG 품질은 1~100 사이로 설정해 주세요.");
+  if (settings.mode === "convert") return {};
+  if (settings.format === "jpg")
+    throw new Error("배경 제거 결과는 투명도를 지원하는 PNG 또는 WebP로 저장해 주세요.");
   const { floor, ceiling, channelThreshold } = settings;
   if (![floor, ceiling, channelThreshold, settings.cropThreshold].every(Number.isFinite))
     throw new Error("옵션에 올바른 숫자를 입력해 주세요.");
@@ -74,8 +95,8 @@ export function getOptions(settings: Settings): DifferenceMattingOptions {
   )
     throw new Error("투명도 하한은 상한보다 작거나 같아야 합니다. 옵션 범위를 확인해 주세요.");
   return {
-    background1: parseColor(settings.background1),
-    background2: parseColor(settings.background2),
+    background1: settings.mode === "pair" ? parseColor(settings.background1) : undefined,
+    background2: settings.mode === "pair" ? parseColor(settings.background2) : undefined,
     floor,
     ceiling,
     channelThreshold,
@@ -153,16 +174,20 @@ export function download(blob: Blob, name: string) {
   anchor.remove();
   setTimeout(() => URL.revokeObjectURL(url), 60000);
 }
-export function outputNames(pairs: Pair[], suffix: string): Map<string, string> {
+export function outputNames(
+  pairs: Pair[],
+  suffix: string,
+  format: Settings["format"] = "png",
+): Map<string, string> {
   const used = new Set<string>();
   const names = new Map<string, string>();
   for (const pair of pairs) {
     const base =
       (safeCharacters(pair.name).replace(/^\.+/, "").trim().slice(0, 120) || "image") +
       safeCharacters(suffix).slice(0, 50);
-    let name = `${base}.png`;
+    let name = `${base}.${format}`;
     let counter = 2;
-    while (used.has(name.toLowerCase())) name = `${base}-${counter++}.png`;
+    while (used.has(name.toLowerCase())) name = `${base}-${counter++}.${format}`;
     used.add(name.toLowerCase());
     names.set(pair.id, name);
   }
